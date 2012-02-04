@@ -85,40 +85,35 @@
  
 import os, sys, socket, struct, select, time
  
-# From /usr/include/linux/icmp.h; your milage may vary.
-ICMP_ECHO_REQUEST = 8 # Seems to be the same on Solaris.
+ICMP_STYPE = 8  #8 by definition, reply type = 0
+ICMP_SCODE = 0
+ICMP_SSEQUENCE = 0
  
  
 def checksum(source_string):
     """
-    I'm not too confident that this is right but testing seems
-    to suggest that it gives the same answers as in_cksum in ping.c
+        procedure explained at http://www.faqs.org/rfcs/rfc1071.html
+        section 3, normal order
     """
     sum = 0
     countTo = (len(source_string)/2)*2
     count = 0
     while count<countTo:
-        thisVal = ord(source_string[count + 1])*256 + ord(source_string[count])
+        thisVal = source_string[count]*256 + source_string[count+1]
         sum = sum + thisVal
-        sum = sum & 0xffffffff # Necessary?
         count = count + 2
  
     if countTo<len(source_string):
-        sum = sum + ord(source_string[len(source_string) - 1])
-        sum = sum & 0xffffffff # Necessary?
- 
-    sum = (sum >> 16)  +  (sum & 0xffff)
-    sum = sum + (sum >> 16)
+        sum = sum + source_string[len(source_string)-1]*256 #process possible orphaned byte
+    
+    sum = (sum >> 16)  +  (sum & 0xffff) #process carrys
     answer = ~sum
-    answer = answer & 0xffff
- 
-    # Swap bytes. Bugger me if I know why.
-    answer = answer >> 8 | (answer << 8 & 0xff00)
+    answer = answer & 0xffff #ugly but nescessary to get into the right format
  
     return answer
  
  
-def receive_one_ping(my_socket, ID, timeout):
+def receive_one_ping(my_socket, ICMP_SID, timeout):
     """
     receive the ping from the socket.
     """
@@ -132,11 +127,16 @@ def receive_one_ping(my_socket, ID, timeout):
  
         timeReceived = time.time()
         recPacket, addr = my_socket.recvfrom(1024)
+        icmpChecksum = recPacket[20:22] + recPacket[24:]
         icmpHeader = recPacket[20:28]
-        type, code, checksum, packetID, sequence = struct.unpack(
+        ICMP_CCHECKSUM = checksum(icmpChecksum)
+        ICMP_RTYPE, ICMP_RCODE, ICMP_RCHECKSUM, ICMP_RID, ICMP_RSEQUENCE = struct.unpack(
             "bbHHh", icmpHeader
         )
-        if packetID == ID:
+        if ICMP_RCHECKSUM != socket.htons(ICMP_CCHECKSUM):
+            return -1;
+
+        if ICMP_RID == ICMP_SID:
             bytesInDouble = struct.calcsize("d")
             timeSent = struct.unpack("d", recPacket[28:28 + bytesInDouble])[0]
             return timeReceived - timeSent
@@ -146,29 +146,27 @@ def receive_one_ping(my_socket, ID, timeout):
             return
  
  
-def send_one_ping(my_socket, dest_addr, ID):
+def send_one_ping(my_socket, dest_addr, ICMP_SID):
     """
     Send one ping to the given >dest_addr<.
     """
     dest_addr  =  socket.gethostbyname(dest_addr)
  
-    # Header is type (8), code (8), checksum (16), id (16), sequence (16)
-    my_checksum = 0
+    ICMP_SCHECKSUM = 0
  
-    # Make a dummy heder with a 0 checksum.
-    header = struct.pack("bbHHh", ICMP_ECHO_REQUEST, 0, my_checksum, ID, 1)
+    # Make a dummy header with a 0 checksum.
+    header = struct.pack("bbHHh", ICMP_STYPE, ICMP_SCODE, ICMP_SCHECKSUM, ICMP_SID, ICMP_SSEQUENCE)
+
     bytesInDouble = struct.calcsize("d")
-    data = (192 - bytesInDouble) * "Q"
-    data = struct.pack("d", time.time()) + data
- 
+    data = (32 - bytesInDouble) * "Q"
+    data = struct.pack("d", time.time()) + data.encode('ascii')
+
     # Calculate the checksum on the data and the dummy header.
-    my_checksum = checksum(header + data)
- 
+    ICMP_SCHECKSUM = checksum(header + data)
+    
     # Now that we have the right checksum, we put that in. It's just easier
     # to make up a new header than to stuff it into the dummy.
-    header = struct.pack(
-        "bbHHh", ICMP_ECHO_REQUEST, 0, socket.htons(my_checksum), ID, 1
-    )
+    header = struct.pack("bbHHh", ICMP_STYPE, ICMP_SCODE, socket.htons(ICMP_SCHECKSUM), ICMP_SID, ICMP_SSEQUENCE)
     packet = header + data
     my_socket.sendto(packet, (dest_addr, 1)) # Don't know about the 1
  
@@ -180,14 +178,14 @@ def do_one(dest_addr, timeout):
     icmp = socket.getprotobyname("icmp")
     try:
         my_socket = socket.socket(socket.AF_INET, socket.SOCK_RAW, icmp)
-    except socket.error, (errno, msg):
+    except socket.error as msg:
         if errno == 1:
             # Operation not permitted
             msg = msg + (
                 " - Note that ICMP messages can only be sent from processes"
                 " running as root."
             )
-            raise socket.error(msg)
+            raise socket.error
         raise # raise the original error
  
     my_ID = os.getpid() & 0xFFFF
@@ -204,24 +202,27 @@ def verbose_ping(dest_addr, timeout = 2, count = 4):
     Send >count< ping to >dest_addr< with the given >timeout< and display
     the result.
     """
-    for i in xrange(count):
-        print "ping %s..." % dest_addr,
+    for i in range(count):
+        print ("ping %s..." % dest_addr)
         try:
             delay  =  do_one(dest_addr, timeout)
-        except socket.gaierror, e:
-            print "failed. (socket error: '%s')" % e[1]
+        except socket.gaierror as e:
+            print ("failed. (socket error: '%s')" % e)
             break
  
         if delay  ==  None:
-            print "failed. (timeout within %ssec.)" % timeout
+            print ("failed. (timeout within %ssec.)" % timeout)
+        elif delay < 0:
+            print ("failed. (echo checksum incorrect.)")
         else:
             delay  =  delay * 1000
-            print "get ping in %0.4fms" % delay
+            print ("get ping in %0.4fms" % delay)
     print
  
  
 if __name__ == '__main__':
-    verbose_ping("heise.de")
+    verbose_ping("nu.nl")
     verbose_ping("google.com")
     verbose_ping("a-test-url-taht-is-not-available.com")
-    verbose_ping("192.168.1.1")
+    for i in range(20):
+        verbose_ping("192.168.1.%s" % i, 2, 1)
